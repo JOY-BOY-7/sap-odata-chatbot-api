@@ -1,18 +1,40 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import requests
-import json
+import io
 import re
+import json
+import base64
 import difflib
+import traceback
+import contextlib
 import xml.etree.ElementTree as ET
 from urllib.parse import urlencode
-import matplotlib.pyplot as plt
-import io
-import contextlib
-import traceback
 
-st.set_page_config(page_title="SAP Odata ChatBot", layout="wide")
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import requests
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+import os
+
+# ========== ENV / CONFIG ==========
+GEMINI_URL_DEFAULT = os.environ.get(
+    "GEMINI_URL",
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
+)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")  # Set in Render Dashboard
+
+# ==================================
+app = FastAPI(title="SAP OData ChatBot API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # tighten for your Fiori host later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -----------------------------
 # Utility Functions
@@ -47,18 +69,12 @@ def extract_json_from_response(resp):
     return None
 
 def validate_expr(expr):
-    """
-    Check for dangerous code. Allow safe imports (like matplotlib) used by Gemini.
-    """
-    forbidden = [
-        "subprocess", "os.", "sys.", "open(", "eval(", "exec(", "__import__", "input("
-    ]
+    forbidden = ["subprocess", "os.", "sys.", "open(", "eval(", "exec(", "__import__", "input("]
     if any(f in expr for f in forbidden):
         raise ValueError("Unsafe code detected.")
     return True
 
 def fuzzy_filter(df, col, value):
-    """Fuzzy filter — for partial string match and tolerance for NaN."""
     col_values = df[col].dropna().astype(str).unique()
     closest = difflib.get_close_matches(str(value), col_values, n=1, cutoff=0.6)
     if closest:
@@ -66,55 +82,29 @@ def fuzzy_filter(df, col, value):
     else:
         return df[df[col].fillna('').str.contains(str(value), case=False, na=False)]
 
-# -----------------------------
-# Enhanced Safe Exec Function (Dynamic Matplotlib)
-# -----------------------------
-def safe_exec(expr, df):
-    """
-    Safely execute Gemini-generated Python expressions.
-    Automatically detects pandas DataFrames, Series, or matplotlib figures.
-    """
-    local_env = {"df": df, "pd": pd, "np": np, "plt": plt, "re": re, "fuzzy_filter": fuzzy_filter}
+# ----- Flexible OData Parser -----
+def parse_odata_any(resp):
+    """Handle either JSON or XML OData responses."""
+    ctype = resp.headers.get("Content-Type", "").lower()
+    if "json" in ctype:
+        js = resp.json()
+        if "d" in js:
+            results = js["d"].get("results", [])
+        else:
+            results = js
+        df = pd.DataFrame(results)
+    else:
+        df = parse_odata_xml(resp.text)
 
-    with st.expander("🧠 Gemini Generated Python Code", expanded=False):
-        st.code(expr, language="python")
+    # Drop or flatten __metadata
+    if "__metadata" in df.columns:
+        # optional: flatten id
+        df["metadata_id"] = df["__metadata"].apply(
+            lambda x: x.get("id") if isinstance(x, dict) else None
+        )
+        df.drop(columns=["__metadata"], inplace=True)
+    return df
 
-    # Capture stdout for multi-line code
-    f = io.StringIO()
-    with contextlib.redirect_stdout(f):
-        try:
-            # Try eval first for one-liner
-            try:
-                result = eval(expr, {}, local_env)
-            except:
-                exec(expr, {}, local_env)
-                # Look for last meaningful object in local_env
-                for k, v in reversed(local_env.items()):
-                    if isinstance(v, (pd.DataFrame, pd.Series, plt.Figure)):
-                        result = v
-                        break
-                else:
-                    result = "✅ Code executed successfully (no direct result returned)"
-        except Exception as e:
-            st.error(f"⚠️ Error executing expression:\n\n{traceback.format_exc()}")
-            return None
-    return result
-
-# -----------------------------
-# Gemini REST API Call
-# -----------------------------
-def call_gemini_json(url, key, prompt, timeout=40):
-    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-    try:
-        return r.json()
-    except:
-        return {"text": r.text}
-
-# -----------------------------
-# OData XML Parsing
-# -----------------------------
 def parse_odata_xml(xml_text):
     ns = {
         'atom': 'http://www.w3.org/2005/Atom',
@@ -139,135 +129,120 @@ def parse_odata_xml(xml_text):
         raise ValueError("No valid data entries found in OData response.")
     return pd.DataFrame(data)
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.title("🤖 SAP Odata ChatBot")
+def call_gemini_json(url, key, prompt, timeout=40):
+    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    try:
+        return r.json()
+    except:
+        return {"text": r.text}
 
-with st.sidebar:
-    st.header("🧠 Gemini Setup")
-    gemini_url = st.text_input(
-        "REST Endpoint URL",
-        value="https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
-    )
-    gemini_key = st.text_input("Gemini API Key (AIza...)", type="password")
-    timeout = st.number_input("Timeout (sec)", value=30, min_value=5, max_value=120)
-
-    st.header("🌐 OData Configuration")
-    odata_url = st.text_input("OData Service URL (EntitySet)", placeholder="https://server/sap/opu/odata/.../EntitySet")
-    username = st.text_input("Username (optional)")
-    password = st.text_input("Password (optional)", type="password")
-
-    st.markdown("---")
-    #st.header("🔍 Optional Query Parameters")
-    #top = st.number_input("$top (limit rows)", min_value=0, value=0, help="0 means no limit")
-    #filter_q = st.text_input("$filter condition", placeholder="Customer eq 'ABC' or Amount gt 1000")
-    #select_q = st.text_input("$select columns", placeholder="Customer,Amount,Date")
-    #orderby_q = st.text_input("$orderby", placeholder="Amount desc")
-
-if not gemini_url or not gemini_key:
-    st.warning("Please enter your Gemini URL and API key.")
-    st.stop()
-
-if not odata_url:
-    st.info("Enter OData service URL to fetch data.")
-    st.stop()
-
-# -----------------------------
-# Build OData Query URL
-# -----------------------------
-params = {}
-#if top > 0:
-    #params["$top"] = top
-#if filter_q.strip():
-    #params["$filter"] = filter_q
-#if select_q.strip():
-   # params["$select"] = select_q
-#if orderby_q.strip():
-    #p#arams["$orderby"] = orderby_q
-
-odata_final_url = odata_url
-if params:
-    odata_final_url += "?" + urlencode(params, safe="=(),' ")
-
-st.write("📡 Fetching from:", odata_final_url)
+def safe_exec(expr, df):
+    local_env = {"df": df, "pd": pd, "np": np, "plt": plt, "re": re, "fuzzy_filter": fuzzy_filter}
+    validate_expr(expr)
+    result = None
+    f = io.StringIO()
+    with contextlib.redirect_stdout(f):
+        try:
+            try:
+                result = eval(expr, {}, local_env)
+            except:
+                exec(expr, {}, local_env)
+                for k, v in list(local_env.items())[::-1]:
+                    if isinstance(v, (pd.DataFrame, pd.Series, plt.Figure)):
+                        result = v
+                        break
+                if result is None:
+                    result = "OK"
+        except Exception:
+            raise
+    if not isinstance(result, plt.Figure):
+        fig = plt.gcf()
+        if fig.get_axes():
+            result = fig
+    return result
 
 # -----------------------------
-# Fetch OData Data
+# Pydantic Models
 # -----------------------------
-# -----------------------------
-# Fetch OData Data (with proxy support)
-# -----------------------------
-try:
-    # Detect if user is using proxy (Flask app) or direct SAP URL
-    is_proxy = "8080/odata" in odata_final_url or "loca.lt/odata" in odata_final_url
+class QueryBody(BaseModel):
+    odata_url: str
+    username: str | None = None
+    password: str | None = None
+    question: str
+    timeout_sec: int | None = 30
+    gemini_url: str | None = None
+    gemini_key: str | None = None
 
-    if is_proxy:
-        # Send credentials via query parameters for Flask proxy
-        params = {
-            "username": username,
-            "password": password,
-            "$format": "json"
-        }
-        resp = requests.get(
-            odata_final_url,
-            params=params,
-            headers={"Accept": "application/json"},
-            timeout=timeout
-        )
-    else:
-        # Direct SAP connection (Basic Auth)
+# -----------------------------
+# Health
+# -----------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# -----------------------------
+# Direct OData proxy (for testing)
+# -----------------------------
+@app.get("/odata-proxy")
+def odata_proxy(
+    url: str = Query(..., description="Full SAP OData URL"),
+    username: str | None = None,
+    password: str | None = None,
+):
+    """Simple proxy: fetch OData with dynamic credentials."""
+    try:
         auth = (username, password) if username and password else None
-        resp = requests.get(
-            odata_final_url,
-            auth=auth,
-            headers={"Accept": "application/atom+xml"},
-            timeout=timeout
-        )
-
-    if resp.status_code != 200:
-        st.error(f"❌ OData fetch failed: {resp.status_code}")
-        st.text(resp.text)
-        st.stop()
-
-    # Parse automatically depending on type
-    content_type = resp.headers.get("Content-Type", "")
-    if "json" in content_type:
-        df = pd.DataFrame(resp.json().get("d", {}).get("results", []))
-    else:
-        df = parse_odata_xml(resp.text)
-
-except Exception as e:
-    st.error(f"❌ Failed to fetch or parse OData: {e}")
-    st.stop()
+        # ensure $format=json
+        if "$format" not in url:
+            sep = "&" if "?" in url else "?"
+            url += f"{sep}$format=json"
+        r = requests.get(url, auth=auth, headers={"Accept": "application/json"}, timeout=30)
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------
-# Prepare DataFrame
+# Core /query endpoint
 # -----------------------------
-orig_cols = df.columns.tolist()
-norm_map = {c: normalize_col(c) for c in orig_cols}
-df.columns = [norm_map[c] for c in orig_cols]
-reverse_map = {v: k for k, v in norm_map.items()}
-fuzzy_map = fuzzy_column_map(df.columns)
+@app.post("/query")
+def query(body: QueryBody):
+    if not body.odata_url or not body.question:
+        raise HTTPException(status_code=400, detail="odata_url and question are required")
 
-# Convert numeric columns
-for c in df.columns:
-    df[c] = pd.to_numeric(df[c], errors='ignore')
+    # --- 1) Fetch OData ---
+    try:
+        auth = (body.username, body.password) if (body.username and body.password) else None
+        # Force JSON for easier parsing
+        if "$format" not in body.odata_url:
+            sep = "&" if "?" in body.odata_url else "?"
+            body.odata_url += f"{sep}$format=json"
+        resp = requests.get(body.odata_url, auth=auth, headers={"Accept": "application/json"}, timeout=body.timeout_sec or 30)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"OData fetch failed: {resp.status_code} {resp.text[:500]}")
+        df = parse_odata_any(resp)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch/parse OData: {e}")
 
-st.success(f"✅ Loaded {len(df)} rows from OData service.")
-st.dataframe(df.head(100))
+    # --- 2) Normalize DF ---
+    orig_cols = df.columns.tolist()
+    norm_map = {c: normalize_col(c) for c in orig_cols}
+    df.columns = [norm_map[c] for c in orig_cols]
+    fuzzy_map = fuzzy_column_map(df.columns)
 
-# -----------------------------
-# Prepare Gemini Prompt
-# -----------------------------
-schema = []
-for c in df.columns:
-    sample = str(df[c].dropna().iloc[0]) if df[c].dropna().shape[0] > 0 else ""
-    schema.append({"name": c, "dtype": str(df[c].dtype), "sample": sample})
-schema_json = json.dumps(schema, indent=2)
-aliases = ", ".join(list(fuzzy_map.keys()))
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors='ignore')
 
-PROMPT_PANDAS_TRANSLATE = f"""
+    # --- 3) Build schema + prompt ---
+    schema = []
+    for c in df.columns:
+        sample = str(df[c].dropna().iloc[0]) if df[c].dropna().shape[0] > 0 else ""
+        schema.append({"name": c, "dtype": str(df[c].dtype), "sample": sample})
+    schema_json = json.dumps(schema, indent=2)
+    aliases = ", ".join(list(fuzzy_map.keys()))
+
+    PROMPT_PANDAS_TRANSLATE = f"""
 You are an expert data reasoning assistant.
 DataFrame 'df' schema:
 {schema_json}
@@ -293,90 +268,85 @@ Rules:
    - For numeric operations: safely handle empty sequences
 """
 
+    gemini_url = body.gemini_url or GEMINI_URL_DEFAULT
+    gemini_key = body.gemini_key or GEMINI_API_KEY
+    if not gemini_key:
+        raise HTTPException(status_code=500, detail="Server missing GEMINI_API_KEY (set it in environment).")
 
-# -----------------------------
-# User Question
-# -----------------------------
-user_q = st.text_input("Ask your question about this OData data:")
-if not user_q:
-    st.stop()
-
-# Step 1: Generate pandas/matplotlib expression
-# Step 1: Generate pandas/matplotlib expression
-with st.spinner("💡 Thinking with Gemini..."):
-    resp = call_gemini_json(
-        gemini_url,
-        gemini_key,
-        PROMPT_PANDAS_TRANSLATE + "\nQuestion: " + user_q,
-        timeout
-    )
+    # --- 4) Ask Gemini for pandas expression ---
+    resp = call_gemini_json(gemini_url, gemini_key, PROMPT_PANDAS_TRANSLATE + "\nQuestion: " + body.question, body.timeout_sec or 30)
     js = extract_json_from_response(resp)
 
-# Handle cases where Gemini returns text-only guidance
-if not js or "expr" not in js:
-    msg = ""
+    if not js or "expr" not in js:
+        msg = ""
+        try:
+            msg = resp["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=f"Gemini didn't return expr. Raw: {msg or str(resp)[:1000]}")
+
+    expr = js["expr"]
+    explain = js.get("explain", "")
+
+    # --- 5) Execute safely ---
     try:
-        msg = resp["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception:
-        pass
+        result_obj = safe_exec(expr, df)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error executing expr:\n{traceback.format_exc()}")
 
-    if msg:
-        if "only ask questions related to data" in msg.lower():
-            st.warning("💡 Gemini says: Only ask questions related to your OData data.")
-        else:
-            st.warning(f"🤖 Gemini replied:\n\n{msg}")
+    # --- 6) Serialize results ---
+    result_table = None
+    result_series = None
+    result_chart_base64 = None
+
+    if isinstance(result_obj, pd.DataFrame):
+        result_table = {
+            "columns": list(result_obj.columns),
+            "rows": result_obj.fillna("").astype(str).values.tolist()
+        }
+    elif isinstance(result_obj, pd.Series):
+        result_series = {
+            "name": str(result_obj.name),
+            "index": [str(x) for x in result_obj.index.tolist()],
+            "values": [str(x) for x in result_obj.fillna("").astype(str).tolist()]
+        }
+    elif isinstance(result_obj, plt.Figure):
+        buf = io.BytesIO()
+        result_obj.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(result_obj)
+        result_chart_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     else:
-        st.error("❌ Gemini response parsing failed:")
-        st.json(resp)
+        fig = plt.gcf()
+        if fig.get_axes():
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", bbox_inches="tight")
+            plt.close(fig)
+            result_chart_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    # Stop here so no error trace shows below input
-    st.stop()
-
-
-expr = js["expr"]
-explain = js.get("explain", "")
-
-# Step 2: Execute safely
-result = safe_exec(expr, df)
-
-# Step 3: Display result or chart dynamically
-if isinstance(result, pd.DataFrame):
-    st.markdown("### 📈 Result Table")
-    st.dataframe(result)
-elif isinstance(result, pd.Series):
-    st.markdown("### 📊 Result Series")
-    st.dataframe(result.to_frame())
-elif isinstance(result, plt.Figure):
-    st.markdown("### 📊 Visualization")
-    st.pyplot(result)
-else:
-    # Check if any matplotlib figure is active
-    fig = plt.gcf()
-    if fig.get_axes():
-        st.markdown("### 📊 Visualization")
-        st.pyplot(fig)
-        plt.close(fig)
-    else:
-        st.markdown(f"### ✅ Result: **{result}**")
-
-# Step 4: English explanation
-PROMPT_ENGLISH = f"""
+    # --- 7) Ask Gemini for natural-language answer ---
+    PROMPT_ENGLISH = f"""
 You are a helpful assistant. 
-Question: {user_q}
-The result is: {repr(result)}
-Give the **answer with explanation**, in natural English.
+Question: {body.question}
+The result is: {repr(result_obj)[:4000]}
+Give the answer with explanation, in natural English.
 """
-with st.spinner("🗣️ Generating natural language answer..."):
-    resp2 = call_gemini_json(gemini_url, gemini_key, PROMPT_ENGLISH, timeout)
+    resp2 = call_gemini_json(gemini_url, gemini_key, PROMPT_ENGLISH, body.timeout_sec or 30)
     try:
-        text = resp2["candidates"][0]["content"]["parts"][0]["text"]
-    except:
-        text = str(resp2)
+        answer_text = resp2["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        answer_text = str(resp2)
 
-st.markdown("### 💬 Chatbot Answer")
-st.write(text)
+    return {
+        "explain": explain,
+        "expr": expr,
+        "answer_text": answer_text,
+        "result_table": result_table,
+        "result_series": result_series,
+        "result_chart_base64": result_chart_base64
+    }
 
-st.markdown("---")
-st.markdown("### 🧾 Executed Expression")
-st.code(expr, language="python")
-st.caption(f"Explanation: {explain}")
+# ---- Local dev runner ----
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
