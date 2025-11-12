@@ -12,10 +12,14 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import requests
+import ssl
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
+import urllib3
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
 import os
 
 # ========== ENV / CONFIG ==========
@@ -30,11 +34,28 @@ app = FastAPI(title="SAP OData ChatBot API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten for your Fiori host later
+    allow_origins=["*"],  # tighten later for your Fiori host
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# -----------------------------
+# SSL Adapter (Legacy SAP Fix)
+# -----------------------------
+class SSLAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = ssl.create_default_context()
+        ctx.options |= 0x4  # SSL_OP_LEGACY_SERVER_CONNECT
+        ctx.check_hostname = False      # ✅ disable hostname check
+        ctx.verify_mode = ssl.CERT_NONE # ✅ allow self-signed SAP certs
+        kwargs["ssl_context"] = ctx
+        return super(SSLAdapter, self).init_poolmanager(*args, **kwargs)
+
+session = requests.Session()
+session.mount("https://", SSLAdapter())
 
 # -----------------------------
 # Utility Functions
@@ -78,13 +99,12 @@ def fuzzy_filter(df, col, value):
     col_values = df[col].dropna().astype(str).unique()
     closest = difflib.get_close_matches(str(value), col_values, n=1, cutoff=0.6)
     if closest:
-        return df[df[col].fillna('').str.contains(closest[0], case=False, na=False)]
+        return df[df[col].fillna("").str.contains(closest[0], case=False, na=False)]
     else:
-        return df[df[col].fillna('').str.contains(str(value), case=False, na=False)]
+        return df[df[col].fillna("").str.contains(str(value), case=False, na=False)]
 
 # ----- Flexible OData Parser -----
 def parse_odata_any(resp):
-    """Handle either JSON or XML OData responses."""
     ctype = resp.headers.get("Content-Type", "").lower()
     if "json" in ctype:
         js = resp.json()
@@ -96,9 +116,7 @@ def parse_odata_any(resp):
     else:
         df = parse_odata_xml(resp.text)
 
-    # Drop or flatten __metadata
     if "__metadata" in df.columns:
-        # optional: flatten id
         df["metadata_id"] = df["__metadata"].apply(
             lambda x: x.get("id") if isinstance(x, dict) else None
         )
@@ -107,21 +125,21 @@ def parse_odata_any(resp):
 
 def parse_odata_xml(xml_text):
     ns = {
-        'atom': 'http://www.w3.org/2005/Atom',
-        'm': 'http://schemas.microsoft.com/ado/2007/08/dataservices/metadata',
-        'd': 'http://schemas.microsoft.com/ado/2007/08/dataservices'
+        "atom": "http://www.w3.org/2005/Atom",
+        "m": "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata",
+        "d": "http://schemas.microsoft.com/ado/2007/08/dataservices",
     }
     root = ET.fromstring(xml_text)
-    entries = root.findall('.//atom:entry', ns)
+    entries = root.findall(".//atom:entry", ns)
     data = []
 
     for entry in entries:
-        props = entry.find('.//m:properties', ns)
+        props = entry.find(".//m:properties", ns)
         if props is None:
             continue
         record = {}
         for child in props:
-            tag = re.sub(r'^{.*}', '', child.tag)
+            tag = re.sub(r"^{.*}", "", child.tag)
             record[tag] = child.text
         data.append(record)
 
@@ -132,7 +150,7 @@ def parse_odata_xml(xml_text):
 def call_gemini_json(url, key, prompt, timeout=40):
     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    r = session.post(url, headers=headers, json=payload, timeout=timeout, verify=False)
     try:
         return r.json()
     except:
@@ -183,7 +201,7 @@ def health():
     return {"status": "ok"}
 
 # -----------------------------
-# Direct OData proxy (for testing)
+# Direct OData proxy
 # -----------------------------
 @app.get("/odata-proxy")
 def odata_proxy(
@@ -191,14 +209,12 @@ def odata_proxy(
     username: str | None = None,
     password: str | None = None,
 ):
-    """Simple proxy: fetch OData with dynamic credentials."""
     try:
         auth = (username, password) if username and password else None
-        # ensure $format=json
         if "$format" not in url:
             sep = "&" if "?" in url else "?"
             url += f"{sep}$format=json"
-        r = requests.get(url, auth=auth, headers={"Accept": "application/json"}, timeout=30)
+        r = session.get(url, auth=auth, headers={"Accept": "application/json"}, timeout=30, verify=False)
         return r.json()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -214,11 +230,16 @@ def query(body: QueryBody):
     # --- 1) Fetch OData ---
     try:
         auth = (body.username, body.password) if (body.username and body.password) else None
-        # Force JSON for easier parsing
         if "$format" not in body.odata_url:
             sep = "&" if "?" in body.odata_url else "?"
             body.odata_url += f"{sep}$format=json"
-        resp = requests.get(body.odata_url, auth=auth, headers={"Accept": "application/json"}, timeout=body.timeout_sec or 30)
+        resp = session.get(
+            body.odata_url,
+            auth=auth,
+            headers={"Accept": "application/json"},
+            timeout=body.timeout_sec or 30,
+            verify=False
+        )
         if resp.status_code != 200:
             raise HTTPException(status_code=502, detail=f"OData fetch failed: {resp.status_code} {resp.text[:500]}")
         df = parse_odata_any(resp)
@@ -230,9 +251,8 @@ def query(body: QueryBody):
     norm_map = {c: normalize_col(c) for c in orig_cols}
     df.columns = [norm_map[c] for c in orig_cols]
     fuzzy_map = fuzzy_column_map(df.columns)
-
     for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors='ignore')
+        df[c] = pd.to_numeric(df[c], errors="ignore")
 
     # --- 3) Build schema + prompt ---
     schema = []
@@ -259,13 +279,18 @@ Rules:
 3. Numeric operations safe
 4. Never hallucinate columns/values
 5. No loops/imports/prints
-6. Always valid Python one-liner
-7. When grouping numeric columns, use aggregation (sum, mean, count)
-8. When a name came up keep in mind that its not full name only part of name
-9. Do not answer general knowledge questions (outside dataset); reply with "only ask questions related to data please".
-10. Always handle NaN values safely:
+6. Never use print() or display()
+7. Always RETURN the final result (DataFrame, Series, numeric, dict, or plt.Figure)
+8. Always handle NaN values safely:
    - For string filters: use str.contains(..., na=False)
    - For numeric operations: safely handle empty sequences
+9. Always assume the expression will be executed inside a safe environment that automatically displays the result.
+10. Do not print anything — simply return the result or expression output.
+11. Prefer one-liners that evaluate to a result directly (no variables unless necessary).
+12. When multiple values are logically related (like total count + list), return a dictionary.
+13. If visualization is the best answer, generate a matplotlib figure object (plt.figure()) and plot accordingly.
+14. When grouping numeric columns, use aggregation (sum, mean, count).
+15. Do not answer general knowledge questions (outside dataset); reply with "only ask questions related to data please".
 """
 
     gemini_url = body.gemini_url or GEMINI_URL_DEFAULT
@@ -274,9 +299,10 @@ Rules:
         raise HTTPException(status_code=500, detail="Server missing GEMINI_API_KEY (set it in environment).")
 
     # --- 4) Ask Gemini for pandas expression ---
-    resp = call_gemini_json(gemini_url, gemini_key, PROMPT_PANDAS_TRANSLATE + "\nQuestion: " + body.question, body.timeout_sec or 30)
+    resp = call_gemini_json(
+        gemini_url, gemini_key, PROMPT_PANDAS_TRANSLATE + "\nQuestion: " + body.question, body.timeout_sec or 30
+    )
     js = extract_json_from_response(resp)
-
     if not js or "expr" not in js:
         msg = ""
         try:
@@ -291,7 +317,7 @@ Rules:
     # --- 5) Execute safely ---
     try:
         result_obj = safe_exec(expr, df)
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail=f"Error executing expr:\n{traceback.format_exc()}")
 
     # --- 6) Serialize results ---
@@ -302,13 +328,13 @@ Rules:
     if isinstance(result_obj, pd.DataFrame):
         result_table = {
             "columns": list(result_obj.columns),
-            "rows": result_obj.fillna("").astype(str).values.tolist()
+            "rows": result_obj.fillna("").astype(str).values.tolist(),
         }
     elif isinstance(result_obj, pd.Series):
         result_series = {
             "name": str(result_obj.name),
             "index": [str(x) for x in result_obj.index.tolist()],
-            "values": [str(x) for x in result_obj.fillna("").astype(str).tolist()]
+            "values": [str(x) for x in result_obj.fillna("").astype(str).tolist()],
         }
     elif isinstance(result_obj, plt.Figure):
         buf = io.BytesIO()
@@ -342,7 +368,7 @@ Give the answer with explanation, in natural English.
         "answer_text": answer_text,
         "result_table": result_table,
         "result_series": result_series,
-        "result_chart_base64": result_chart_base64
+        "result_chart_base64": result_chart_base64,
     }
 
 # ---- Local dev runner ----
