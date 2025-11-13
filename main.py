@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 import time
 from datetime import datetime, timedelta
 from functools import lru_cache
+import threading
 
 import numpy as np
 import pandas as pd
@@ -31,7 +32,8 @@ GEMINI_URL_DEFAULT = os.environ.get(
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
 )
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-CACHE_TTL_MINUTES = int(os.environ.get("CACHE_TTL_MINUTES", "30"))  # 🆕 default 30 min
+CACHE_TTL_MINUTES = int(os.environ.get("CACHE_TTL_MINUTES", "30"))  # default 30 min
+DEFAULT_TIMEOUT = int(os.environ.get("DEFAULT_TIMEOUT_SEC", "30"))
 
 # ==================================
 app = FastAPI(title="SAP OData ChatBot API")
@@ -58,16 +60,21 @@ class SSLAdapter(HTTPAdapter):
         kwargs["ssl_context"] = ctx
         return super(SSLAdapter, self).init_poolmanager(*args, **kwargs)
 
+# global session only used for Gemini calls (safe-ish) - we still use per-request sessions for OData fetch
 session = requests.Session()
 session.mount("https://", SSLAdapter())
 
 # ================================================================
-# 🆕 CACHING LAYER FOR ODATA
+# CACHING LAYER FOR ODATA (raw + processed)
 # ================================================================
-_odata_cache = {}  # {(url, username, password): (timestamp, dataframe)}
+_odata_cache = {}         # {(url, username, password): (timestamp, dataframe)}
+_processed_cache = {}    # {(url, username, password): (timestamp, processed_bundle)}
+_fetch_locks = {}        # {(key): threading.Lock()}
 
 def _cache_key(url, username, password):
-    return f"{url}::{username or ''}::{password or ''}"
+    # Do not include trailing $format differences -> normalize
+    u = url.split("$format")[0]
+    return f"{u}::{username or ''}::{password or ''}"
 
 def _is_cache_valid(entry):
     ts, _ = entry
@@ -75,6 +82,13 @@ def _is_cache_valid(entry):
 
 def clear_odata_cache():
     _odata_cache.clear()
+
+def clear_processed_cache():
+    _processed_cache.clear()
+
+def clear_all_caches():
+    clear_odata_cache()
+    clear_processed_cache()
 
 def get_cached_odata(url, username, password):
     key = _cache_key(url, username, password)
@@ -86,6 +100,30 @@ def get_cached_odata(url, username, password):
 def set_cached_odata(url, username, password, df):
     key = _cache_key(url, username, password)
     _odata_cache[key] = (datetime.now(), df.copy())
+
+def get_cached_processed(url, username, password):
+    key = _cache_key(url, username, password)
+    entry = _processed_cache.get(key)
+    if entry and _is_cache_valid(entry):
+        return entry[1]
+    return None
+
+def set_cached_processed(url, username, password, processed_bundle):
+    key = _cache_key(url, username, password)
+    # store a shallow copy for safety
+    _processed_cache[key] = (datetime.now(), {
+        "df": processed_bundle["df"].copy(),
+        "fuzzy": processed_bundle["fuzzy"],
+        "schema_json": processed_bundle["schema_json"],
+        "aliases": processed_bundle["aliases"],
+    })
+
+def _get_lock_for_key(key):
+    lock = _fetch_locks.get(key)
+    if lock is None:
+        lock = threading.Lock()
+        _fetch_locks[key] = lock
+    return lock
 # ================================================================
 
 
@@ -180,6 +218,7 @@ def parse_odata_xml(xml_text):
 def call_gemini_json(url, key, prompt, timeout=40):
     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    # reuse global SSL-enabled session for Gemini (safe), but allow per-call timeout
     r = session.post(url, headers=headers, json=payload, timeout=timeout, verify=False)
     try:
         return r.json()
@@ -219,7 +258,7 @@ class QueryBody(BaseModel):
     username: str | None = None
     password: str | None = None
     question: str
-    timeout_sec: int | None = 30
+    timeout_sec: int | None = DEFAULT_TIMEOUT
     gemini_url: str | None = None
     gemini_key: str | None = None
 
@@ -228,13 +267,100 @@ class QueryBody(BaseModel):
 # -----------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "cache_entries": len(_odata_cache)}
+    return {"status": "ok", "raw_cache_entries": len(_odata_cache), "processed_cache_entries": len(_processed_cache)}
 
-# 🆕 Endpoint to clear cache manually
+# Endpoint to clear cache manually (clears both raw & processed)
 @app.get("/clear-cache")
 def clear_cache():
-    clear_odata_cache()
+    clear_all_caches()
     return {"status": "cache cleared"}
+
+# -----------------------------
+# Helper: fetch raw OData now (per-request session, thread-safe)
+# -----------------------------
+def fetch_odata_now(url, username=None, password=None, timeout=30):
+    auth = (username, password) if (username and password) else None
+    # ensure $format=json present (but don't mutate caller's string)
+    if "$format" not in url:
+        sep = "&" if "?" in url else "?"
+        url_with_format = url + f"{sep}$format=json"
+    else:
+        url_with_format = url
+
+    with requests.Session() as s:
+        s.mount("https://", SSLAdapter())
+        try:
+            resp = s.get(
+                url_with_format,
+                auth=auth,
+                headers={"Accept": "application/json"},
+                timeout=timeout,
+                verify=False
+            )
+        except requests.exceptions.ConnectTimeout:
+            raise HTTPException(status_code=504, detail="OData connection timed out (SAP server not responding).")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"OData connection error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"OData fetch failed: {resp.status_code} {resp.text[:500]}")
+    return resp
+
+# -----------------------------
+# Helper: get processed bundle (df normalized, fuzzy map, schema_json, aliases)
+# -----------------------------
+def get_processed_bundle(odata_url, username, password, timeout=30):
+    key = _cache_key(odata_url, username, password)
+
+    # 1) Try processed cache
+    proc = get_cached_processed(odata_url, username, password)
+    if proc is not None:
+        return proc, True  # processed cache hit
+
+    # Acquire per-key lock so only one thread fetches/processes at a time
+    lock = _get_lock_for_key(key)
+    with lock:
+        # double-check after acquiring lock
+        proc = get_cached_processed(odata_url, username, password)
+        if proc is not None:
+            return proc, True
+
+        # 2) Try raw cache
+        raw_df = get_cached_odata(odata_url, username, password)
+        if raw_df is None:
+            # fetch fresh using per-request session
+            resp = fetch_odata_now(odata_url, username, password, timeout=timeout)
+            raw_df = parse_odata_any(resp)
+            set_cached_odata(odata_url, username, password, raw_df)
+
+        # 3) Process (this is the expensive step we now cache)
+        orig_cols = raw_df.columns.tolist()
+        norm_map = {c: normalize_col(c) for c in orig_cols}
+        df_proc = raw_df.copy()
+        df_proc.columns = [norm_map[c] for c in orig_cols]
+        fuzzy_map = fuzzy_column_map(df_proc.columns)
+
+        for c in df_proc.columns:
+            df_proc[c] = pd.to_numeric(df_proc[c], errors="ignore")
+
+        schema = []
+        for c in df_proc.columns:
+            sample = str(df_proc[c].dropna().iloc[0]) if df_proc[c].dropna().shape[0] > 0 else ""
+            schema.append({"name": c, "dtype": str(df_proc[c].dtype), "sample": sample})
+        schema_json = json.dumps(schema, indent=2)
+        aliases = ", ".join(list(fuzzy_map.keys()))
+
+        processed_bundle = {
+            "df": df_proc,
+            "fuzzy": fuzzy_map,
+            "schema_json": schema_json,
+            "aliases": aliases,
+        }
+
+        # store processed cache
+        set_cached_processed(odata_url, username, password, processed_bundle)
+
+        return processed_bundle, False
 
 # -----------------------------
 # Core /query endpoint
@@ -244,45 +370,28 @@ def query(body: QueryBody):
     if not body.odata_url or not body.question:
         raise HTTPException(status_code=400, detail="odata_url and question are required")
 
-    # 🆕 Try cache first
-    df = get_cached_odata(body.odata_url, body.username, body.password)
-    if df is None:
-        # --- Fetch OData if not cached ---
-        try:
-            auth = (body.username, body.password) if (body.username and body.password) else None
-            if "$format" not in body.odata_url:
-                sep = "&" if "?" in body.odata_url else "?"
-                body.odata_url += f"{sep}$format=json"
-            resp = session.get(
-                body.odata_url,
-                auth=auth,
-                headers={"Accept": "application/json"},
-                timeout=body.timeout_sec or 30,
-                verify=False
-            )
-            if resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"OData fetch failed: {resp.status_code} {resp.text[:500]}")
-            df = parse_odata_any(resp)
-            set_cached_odata(body.odata_url, body.username, body.password, df)  # 🆕 store in cache
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to fetch/parse OData: {e}")
+    gemini_url = body.gemini_url or GEMINI_URL_DEFAULT
+    gemini_key = body.gemini_key or GEMINI_API_KEY
+    if not gemini_key:
+        raise HTTPException(status_code=500, detail="Missing GEMINI_API_KEY.")
 
-    # --- Normalize DF ---
-    orig_cols = df.columns.tolist()
-    norm_map = {c: normalize_col(c) for c in orig_cols}
-    df.columns = [norm_map[c] for c in orig_cols]
-    fuzzy_map = fuzzy_column_map(df.columns)
-    for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="ignore")
+    # 1) Get processed bundle (may use cache) - fast after first run
+    try:
+        processed, used_processed_cache = get_processed_bundle(
+            body.odata_url, body.username, body.password, timeout=body.timeout_sec or DEFAULT_TIMEOUT
+        )
+    except HTTPException as e:
+        # rethrow HTTPExceptions
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to prepare data: {e}")
 
-    # --- Gemini + Execution ---
-    schema = []
-    for c in df.columns:
-        sample = str(df[c].dropna().iloc[0]) if df[c].dropna().shape[0] > 0 else ""
-        schema.append({"name": c, "dtype": str(df[c].dtype), "sample": sample})
-    schema_json = json.dumps(schema, indent=2)
-    aliases = ", ".join(list(fuzzy_map.keys()))
+    df = processed["df"]
+    fuzzy_map = processed["fuzzy"]
+    schema_json = processed["schema_json"]
+    aliases = processed["aliases"]
 
+    # 2) Build Gemini prompt quickly using cached schema_json & aliases
     PROMPT_PANDAS_TRANSLATE = f"""
 You are an expert data reasoning assistant.
 DataFrame 'df' schema:
@@ -308,26 +417,31 @@ Rules:
 14. When grouping numeric columns, use aggregation (sum, mean, count).
 15. Do not answer general knowledge questions (outside dataset); reply with "only ask questions related to data please".
 """
-    gemini_url = body.gemini_url or GEMINI_URL_DEFAULT
-    gemini_key = body.gemini_key or GEMINI_API_KEY
-    if not gemini_key:
-        raise HTTPException(status_code=500, detail="Missing GEMINI_API_KEY.")
 
+    # 3) Call Gemini for pandas expression
     resp = call_gemini_json(
-        gemini_url, gemini_key, PROMPT_PANDAS_TRANSLATE + "\nQuestion: " + body.question, body.timeout_sec or 30
+        gemini_url, gemini_key, PROMPT_PANDAS_TRANSLATE + "\nQuestion: " + body.question, body.timeout_sec or DEFAULT_TIMEOUT
     )
     js = extract_json_from_response(resp)
     if not js or "expr" not in js:
-        raise HTTPException(status_code=400, detail="Gemini didn't return expr.")
+        # provide raw Gemini text in error for debugging
+        msg = ""
+        try:
+            msg = resp["candidates"][0]["content"][0]["text"]
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=f"Gemini didn't return expr. Raw: {msg or str(resp)[:1000]}")
+
     expr = js["expr"]
     explain = js.get("explain", "")
 
+    # 4) Execute expression safely (on processed df)
     try:
         result_obj = safe_exec(expr, df)
     except Exception:
         raise HTTPException(status_code=500, detail=f"Error executing expr:\n{traceback.format_exc()}")
 
-    # Serialize results
+    # 5) Serialize results
     result_table = result_series = result_chart_base64 = None
     if isinstance(result_obj, pd.DataFrame):
         result_table = {"columns": list(result_obj.columns), "rows": result_obj.fillna("").astype(str).values.tolist()}
@@ -342,19 +456,37 @@ Rules:
         result_obj.savefig(buf, format="png", bbox_inches="tight")
         plt.close(result_obj)
         result_chart_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    else:
+        # if there is a current matplotlib figure
+        fig = plt.gcf()
+        if fig.get_axes():
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", bbox_inches="tight")
+            plt.close(fig)
+            result_chart_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    PROMPT_ENGLISH = f"Question: {body.question}\nResult: {repr(result_obj)[:2000]}\nExplain in plain English."
-    resp2 = call_gemini_json(gemini_url, gemini_key, PROMPT_ENGLISH, body.timeout_sec or 30)
+    # 6) Ask Gemini for natural-language answer (shorter repr)
+    PROMPT_ENGLISH = f"""
+You are a helpful assistant. 
+Question: {body.question}
+The result is: {repr(result_obj)[:2000]}
+Give the answer with explanation, in natural English.
+"""
+    resp2 = call_gemini_json(gemini_url, gemini_key, PROMPT_ENGLISH, body.timeout_sec or DEFAULT_TIMEOUT)
     try:
-        answer_text = resp2["candidates"][0]["content"]["parts"][0]["text"]
+        answer_text = resp2["candidates"][0]["content"][0]["text"]
     except Exception:
-        answer_text = str(resp2)
+        # fallback
+        try:
+            answer_text = resp2["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            answer_text = str(resp2)
 
     return {
         "explain": explain,
         "expr": expr,
         "answer_text": answer_text,
-        "cached": df is not None,
+        "used_processed_cache": used_processed_cache,
         "result_table": result_table,
         "result_series": result_series,
         "result_chart_base64": result_chart_base64,
