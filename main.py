@@ -475,9 +475,14 @@ Rules:
 
         # If tuple index → convert to DataFrame dynamically (no hardcoding)
         if is_tuple_index:
-            max_len = max(len(r) for r in parsed_rows)
-            col_names = [f"level_{i}" for i in range(max_len)]
-
+            raw_names = result_obj.index.names
+            col_names = []
+            for i, r in enumerate(parsed_rows[0]):
+                if raw_names and i < len(raw_names) and raw_names[i] is not None:
+                    col_names.append(raw_names[i])
+                else:
+                    col_names.append(f"level_{i}")
+     # Use real index names if available, else fallback to level_0, level_1...
             df_temp = pd.DataFrame(parsed_rows, columns=col_names)
             df_temp[result_obj.name] = val_list
 
