@@ -446,11 +446,52 @@ Rules:
     if isinstance(result_obj, pd.DataFrame):
         result_table = {"columns": list(result_obj.columns), "rows": result_obj.fillna("").astype(str).values.tolist()}
     elif isinstance(result_obj, pd.Series):
+
+    import ast
+
+    idx_list = result_obj.index.tolist()
+    val_list = result_obj.values.tolist()
+
+    parsed_rows = []
+    is_tuple_index = False
+
+    for idx in idx_list:
+        idx_str = str(idx)
+
+        # Detect tuple-like string index
+        try:
+            parsed = ast.literal_eval(idx_str)
+            if isinstance(parsed, tuple):
+                is_tuple_index = True
+                parsed_rows.append(list(parsed))
+            else:
+                parsed_rows.append([idx_str])
+        except:
+            parsed_rows.append([idx_str])
+
+    # If tuples detected → convert to DataFrame dynamically
+    if is_tuple_index:
+        # Auto-generate column names: level_0, level_1, level_2, ...
+        max_len = max(len(r) for r in parsed_rows)
+        col_names = [f"level_{i}" for i in range(max_len)]
+
+        df_temp = pd.DataFrame(parsed_rows, columns=col_names)
+        df_temp[result_obj.name] = val_list
+
+        result_table = {
+            "columns": list(df_temp.columns),
+            "rows": df_temp.fillna("").astype(str).values.tolist()
+        }
+        result_series = None
+
+    else:
+        # Normal Series (NOT tuple-index)
         result_series = {
             "name": str(result_obj.name),
-            "index": [str(x) for x in result_obj.index.tolist()],
+            "index": [str(x) for x in idx_list],
             "values": [str(x) for x in result_obj.fillna("").astype(str).tolist()],
         }
+
     elif isinstance(result_obj, plt.Figure):
         buf = io.BytesIO()
         result_obj.savefig(buf, format="png", bbox_inches="tight")
